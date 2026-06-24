@@ -1,11 +1,11 @@
 openapi: 3.0.3
 info:
-  title: Trust Scoring Service
+  title: Agent Passport — Trust Scoring Service
   description: |
-    Stateless trust scoring API for Algorand wallets.
+    Stateless trust scoring API for AI agents on Algorand testnet.
 
-    Fetches on-chain data from Algorand testnet and computes composite trust scores.
-    No database, no payments, no authentication required.
+    Fetches on-chain data from Algorand testnet and computes composite trust scores,
+    delegation trust, sybil detection, reputation, credit estimation, and underwriting decisions.
   version: 0.1.0
   contact:
     name: Agent Passport
@@ -18,6 +18,25 @@ servers:
     description: Local development
 
 paths:
+  /health:
+    get:
+      summary: Health check with Algorand connectivity probe
+      operationId: healthCheck
+      tags: [System]
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service degraded (Algorand unreachable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
   /score:
     get:
       summary: Compute trust score for a wallet
@@ -35,7 +54,6 @@ paths:
             type: string
             pattern: '^[A-Z2-7]{58}$'
           description: Algorand wallet address (58-char base32)
-          example: SEED_A_001
       responses:
         '200':
           description: Trust score
@@ -45,109 +63,632 @@ paths:
                 $ref: '#/components/schemas/TrustScoreResponse'
         '400':
           description: Invalid wallet address
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Wallet not found on testnet
         '429':
           description: Rate limit exceeded
         '500':
           description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
 
-  /health:
+  /delegation:
     get:
-      summary: Health check
-      operationId: healthCheck
-      tags: [System]
+      summary: Compute delegation trust for a wallet
+      description: |
+        Returns delegation trust score based on the wallet's endorsement network.
+        Traverses the delegation graph (BFS) to find trust anchors and compute
+        depth, sponsor quality, sponsor count, and delegated amount scores.
+      operationId: getDelegation
+      tags: [Trust]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
       responses:
         '200':
-          description: Service status
+          description: Delegation trust score
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/HealthResponse'
+                $ref: '#/components/schemas/DelegationResponse'
+        '400':
+          description: Invalid wallet address
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /counterparty-check:
+    post:
+      summary: Verify a counterparty for agent commerce
+      description: |
+        Evaluates whether a buyer wallet is trustworthy for a transaction.
+        Combines on-chain trust score with delegation trust to produce
+        a combined score, confidence level, and allow/deny decision.
+      operationId: checkCounterparty
+      tags: [Commerce]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [buyer]
+              properties:
+                buyer:
+                  type: string
+                  pattern: '^[A-Z2-7]{58}$'
+                  description: Buyer wallet address to verify
+      responses:
+        '200':
+          description: Counterparty verification result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CounterpartyResponse'
+        '400':
+          description: Missing or invalid buyer wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /credit-estimate:
+    post:
+      summary: Estimate credit capacity for a wallet
+      description: |
+        Computes the maximum credit a wallet can receive based on on-chain
+        capacity: balance, activity, and account age. Optionally validates
+        against a specific requested amount.
+      operationId: estimateCredit
+      tags: [Credit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wallet]
+              properties:
+                wallet:
+                  type: string
+                  pattern: '^[A-Z2-7]{58}$'
+                amount:
+                  type: number
+                  minimum: 0
+                  description: Optional requested amount to validate against capacity
+      responses:
+        '200':
+          description: Credit estimate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreditEstimateResponse'
+        '400':
+          description: Invalid wallet or amount
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /sybil-check:
+    get:
+      summary: Detect sybil risk for a wallet
+      description: |
+        Analyzes whether a wallet is part of a sybil farm using 11 signals:
+        creation clustering, interaction density, balance similarity,
+        circular activity, timing regularity, amount fingerprint,
+        funding correlation, neighborhood clustering, hub score,
+        intermediate density, and temporal correlation.
+      operationId: checkSybil
+      tags: [Security]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
+      responses:
+        '200':
+          description: Sybil risk analysis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SybilResponse'
+        '400':
+          description: Invalid wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /reputation:
+    get:
+      summary: Compute reputation score for a wallet
+      description: |
+        Returns the reputation score based on on-chain reputation events
+        (payments, purchases, disputes, refunds, endorsements, services)
+        recorded in the reputation smart contract.
+      operationId: getReputation
+      tags: [Reputation]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
+      responses:
+        '200':
+          description: Reputation score
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReputationResponse'
+        '400':
+          description: Invalid wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /reputation/record:
+    post:
+      summary: Record a reputation event on-chain
+      description: |
+        Records a reputation event (payment, purchase, dispute, refund,
+        endorsement, or service) to the reputation smart contract.
+        Disputes and refunds require verified counterparty and on-chain proof.
+        Self-reported events require on-chain transaction evidence.
+      operationId: recordReputation
+      tags: [Reputation]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wallet, eventType]
+              properties:
+                wallet:
+                  type: string
+                  pattern: '^[A-Z2-7]{58}$'
+                eventType:
+                  type: string
+                  enum: [payment, purchase, dispute, refund, endorsement, service]
+                amount:
+                  type: number
+                  minimum: 0
+                  description: Event amount (optional, defaults to 0)
+                counterparty:
+                  type: string
+                  pattern: '^[A-Z2-7]{58}$'
+                  description: Counterparty wallet (required for disputes/refunds)
+      responses:
+        '200':
+          description: Event recorded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReputationEventResponse'
+        '400':
+          description: Invalid input or verification failed
+        '500':
+          description: Internal server error
+
+  /underwrite:
+    get:
+      summary: Underwrite a wallet for credit
+      description: |
+        Makes a credit decision using 4 factors: trust score (0.35),
+        delegation trust (0.25), sybil resistance (0.20), and
+        reputation (0.20). Returns approval/denial, recommended limit,
+        risk level, and detailed explanation.
+      operationId: underwrite
+      tags: [Credit]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
+      responses:
+        '200':
+          description: Underwriting decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnderwritingResponse'
+        '400':
+          description: Invalid wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /trust-graph:
+    get:
+      summary: Analyze trust graph for a wallet
+      description: |
+        Performs BFS traversal of the delegation graph to map trust relationships.
+        Returns nodes, edges, trust paths, exposure analysis, and what-if scenarios
+        for sponsor removal. Maximum depth: 5 levels.
+      operationId: analyzeTrustGraph
+      tags: [Graph]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
+      responses:
+        '200':
+          description: Trust graph analysis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustGraphResponse'
+        '400':
+          description: Invalid wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
+
+  /passport:
+    get:
+      summary: Generate Agent Passport document
+      description: |
+        Generates a comprehensive Agent Passport document for a wallet.
+        Combines trust score, delegation, reputation, sybil detection,
+        and credit estimation into a single verifiable document with
+        SHA-256 checksum over all deterministic fields.
+      operationId: getPassport
+      tags: [Passport]
+      parameters:
+        - name: wallet
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Z2-7]{58}$'
+      responses:
+        '200':
+          description: Agent Passport document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PassportResponse'
+        '400':
+          description: Invalid wallet
+        '404':
+          description: Wallet not found
+        '500':
+          description: Internal server error
 
 components:
   schemas:
-    TrustScoreResponse:
-      type: object
-      properties:
-        wallet:
-          type: string
-          description: Algorand wallet address
-        trustScore:
-          type: number
-          minimum: 0
-          maximum: 100
-          description: Composite trust score
-        riskLevel:
-          type: string
-          enum: [low, medium, high, critical]
-        approved:
-          type: boolean
-          description: Whether wallet meets minimum threshold (>= 40)
-        recommendedLimit:
-          type: number
-          description: Recommended credit limit in USD
-        breakdown:
-          type: object
-          properties:
-            ageScore:
-              type: number
-            activityScore:
-              type: number
-            volumeScore:
-              type: number
-            velocityScore:
-              type: number
-            complianceScore:
-              type: number
-        onChain:
-          type: object
-          properties:
-            balanceAlgo:
-              type: number
-            totalTxns:
-              type: integer
-            assetCount:
-              type: integer
-            appCount:
-              type: integer
-            accountAgeDays:
-              type: integer
-            firstSeenRound:
-              type: integer
-            lastSeenRound:
-              type: integer
-        explanation:
-          type: array
-          items:
-            type: string
-          description: Human-readable reasons
-
     HealthResponse:
       type: object
       properties:
         status:
           type: string
+          enum: [ok, degraded]
         service:
           type: string
         version:
           type: string
         network:
           type: string
+        x402:
+          type: boolean
         timestamp:
           type: string
           format: date-time
+        algorand:
+          type: object
+          properties:
+            connected:
+              type: boolean
+            round:
+              type: integer
+
+    TrustScoreResponse:
+      type: object
+      properties:
+        wallet:
+          type: string
+        trustScore:
+          type: number
+          minimum: 0
+          maximum: 100
+        riskLevel:
+          type: string
+          enum: [low, medium, high, critical]
+        approved:
+          type: boolean
+        recommendedLimit:
+          type: number
+        breakdown:
+          type: object
+          properties:
+            ageScore: { type: number }
+            activityScore: { type: number }
+            volumeScore: { type: number }
+            velocityScore: { type: number }
+            complianceScore: { type: number }
+        onChain:
+          type: object
+          properties:
+            balanceAlgo: { type: number }
+            totalTxns: { type: integer }
+            assetCount: { type: integer }
+            appCount: { type: integer }
+            accountAgeDays: { type: integer }
+            firstSeenRound: { type: integer }
+            lastSeenRound: { type: integer }
+        explanation:
+          type: array
+          items: { type: string }
+
+    DelegationResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        trustScore: { type: number }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        approved: { type: boolean }
+        recommendedLimit: { type: number }
+        breakdown:
+          type: object
+          properties:
+            depthScore: { type: number }
+            sponsorQualityScore: { type: number }
+            sponsorCountScore: { type: number }
+            amountScore: { type: number }
+        delegation:
+          type: object
+          properties:
+            depth: { type: integer }
+            sponsorCount: { type: integer }
+            sponsorQuality: { type: number }
+            delegationPath: { type: array, items: { type: string } }
+            totalDelegatedAmount: { type: number }
+            isTrustAnchor: { type: boolean }
+            trustedAncestors: { type: integer }
+        explanation: { type: array, items: { type: string } }
+
+    CounterpartyResponse:
+      type: object
+      properties:
+        allow: { type: boolean }
+        confidence: { type: number }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        trustScore: { type: number }
+        onChainScore: { type: number }
+        delegationScore: { type: number }
+        explanation: { type: array, items: { type: string } }
+
+    CreditEstimateResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        estimatedLimit: { type: number }
+        risk: { type: string, enum: [low, medium, high, critical] }
+        confidence: { type: number }
+        approved: { type: boolean }
+        breakdown:
+          type: object
+          properties:
+            balanceCapacity: { type: number }
+            activityBonus: { type: number }
+            ageBonus: { type: number }
+            riskPenalty: { type: number }
+        explanation: { type: array, items: { type: string } }
+
+    SybilResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        sybilRisk: { type: number }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        confidence: { type: number }
+        clusterSize: { type: integer }
+        signals:
+          type: object
+          properties:
+            creationClustering: { type: number }
+            interactionDensity: { type: number }
+            balanceSimilarity: { type: number }
+            circularActivity: { type: number }
+            timingRegularity: { type: number }
+            amountFingerprint: { type: number }
+            fundingCorrelation: { type: number }
+            neighborhoodClustering: { type: number }
+            hubScore: { type: number }
+            intermediateDensity: { type: number }
+            componentRatio: { type: number }
+            temporalCorrelation: { type: number }
+        flaggedWallets: { type: array, items: { type: string } }
+        explanation: { type: array, items: { type: string } }
+
+    ReputationResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        reputation: { type: number }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        confidence: { type: number }
+        breakdown:
+          type: object
+          properties:
+            successfulPayments: { type: integer }
+            successfulPurchases: { type: integer }
+            disputes: { type: integer }
+            refunds: { type: integer }
+            sponsorEndorsements: { type: integer }
+            serviceInteractions: { type: integer }
+            totalEvents: { type: integer }
+            positiveEvents: { type: integer }
+            negativeEvents: { type: integer }
+        explanation: { type: array, items: { type: string } }
+
+    ReputationEventResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        eventType: { type: string }
+        amount: { type: number }
+        counterparty: { type: string }
+        round: { type: integer }
+        timestamp: { type: integer }
+        eventHash: { type: string }
+        counterpartyVerified: { type: boolean }
+        txId: { type: string, description: 'Algorand transaction ID (if submitted)' }
+
+    UnderwritingResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        approved: { type: boolean }
+        recommendedLimit: { type: number }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        confidence: { type: number }
+        compositeScore: { type: number }
+        factors:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              score: { type: number }
+              weight: { type: number }
+              contribution: { type: number }
+              status: { type: string, enum: [positive, neutral, negative] }
+        explanation: { type: array, items: { type: string } }
+
+    TrustGraphResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        depth: { type: integer }
+        nodeCount: { type: integer }
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              from: { type: string }
+              to: { type: string }
+              amount: { type: number }
+              round: { type: integer }
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              address: { type: string }
+              trustScore: { type: number }
+              balanceAlgo: { type: number }
+              depth: { type: integer }
+        paths:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: array, items: { type: string } }
+              depth: { type: integer }
+              totalDelegated: { type: number }
+              weakestLink: { type: number }
+        exposure:
+          type: object
+          properties:
+            totalExposure: { type: number }
+            directExposure: { type: number }
+            indirectExposure: { type: number }
+            exposureByDepth:
+              type: array
+              items:
+                type: object
+                properties:
+                  depth: { type: integer }
+                  amount: { type: number }
+                  wallets: { type: integer }
+            maxLossIfSponsorFails: { type: number }
+        whatIfs:
+          type: array
+          items:
+            type: object
+            properties:
+              sponsorRemoved: { type: string }
+              originalScore: { type: number }
+              newScore: { type: number }
+              scoreImpact: { type: number }
+              affectedWallets: { type: integer }
+              explanation: { type: array, items: { type: string } }
+        explanation: { type: array, items: { type: string } }
+
+    PassportResponse:
+      type: object
+      properties:
+        wallet: { type: string }
+        generatedAt: { type: string, format: date-time }
+        blockRound: { type: integer }
+        schemaVersion: { type: integer }
+        identityStrength: { type: number }
+        trustScore: { type: number }
+        trustRiskLevel: { type: string, enum: [low, medium, high, critical] }
+        reputation: { type: number }
+        reputationRiskLevel: { type: string, enum: [low, medium, high, critical] }
+        totalEvents: { type: integer }
+        paymentReliability: { type: number }
+        creditLimit: { type: number }
+        creditRisk: { type: string, enum: [low, medium, high, critical] }
+        risk: { type: number }
+        sybilRisk: { type: number }
+        overallRiskLevel: { type: string, enum: [low, medium, high, critical] }
+        onChain:
+          type: object
+          properties:
+            balanceAlgo: { type: number }
+            totalTxns: { type: integer }
+            accountAgeDays: { type: integer }
+            assets: { type: integer }
+            apps: { type: integer }
+        delegation:
+          type: object
+          properties:
+            depth: { type: integer }
+            sponsorCount: { type: integer }
+            delegatedAmount: { type: number }
+            isTrustAnchor: { type: boolean }
+        capabilities:
+          type: object
+          properties:
+            trustScoring: { type: boolean }
+            delegation: { type: boolean }
+            creditEligible: { type: boolean }
+            sybilClear: { type: boolean }
+            reputationActive: { type: boolean }
+        dataSources:
+          type: object
+          properties:
+            trust: { type: boolean }
+            delegation: { type: boolean }
+            credit: { type: boolean }
+            sybil: { type: boolean }
+            reputation: { type: boolean }
+        summary: { type: string }
+        explanation: { type: array, items: { type: string } }
+        checksum: { type: string, description: 'SHA-256 checksum over deterministic fields' }
 
     ErrorResponse:
       type: object
       properties:
         error:
           type: string
-        statusCode:
-          type: integer
