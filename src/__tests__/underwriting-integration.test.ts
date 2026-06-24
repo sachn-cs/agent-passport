@@ -21,11 +21,10 @@ describe('Underwriting Decision Engine — Integration Tests (Real Testnet)', ()
     const result = await underwrite(TESTNET_WALLET);
 
     expect(result).not.toBeNull();
-    expect(result!.factors.length).toBeGreaterThanOrEqual(5);
+    expect(result!.factors.length).toBe(4);
     const names = result!.factors.map(f => f.name);
     expect(names).toContain('Trust Score');
     expect(names).toContain('Delegation Trust');
-    expect(names).toContain('Credit Capacity');
     expect(names).toContain('Sybil Resistance');
     expect(names).toContain('Reputation');
   }, 60000);

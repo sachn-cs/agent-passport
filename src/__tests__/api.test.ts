@@ -415,7 +415,7 @@ describe('API Endpoints', () => {
         risk: 'low',
         confidence: 0.78,
         approved: true,
-        breakdown: { balanceCapacity: 250, activityBonus: 45, ageBonus: 30, delegationBonus: 112.50, riskPenalty: 0 },
+        breakdown: { balanceCapacity: 250, activityBonus: 45, ageBonus: 30, riskPenalty: 0 },
         explanation: ['Strong collateral'],
       };
       mockEstimateCredit.mockResolvedValueOnce(mockResult as any);
@@ -432,7 +432,7 @@ describe('API Endpoints', () => {
         risk: 'low',
         confidence: 0.78,
         approved: true,
-        breakdown: { balanceCapacity: 250, activityBonus: 45, ageBonus: 30, delegationBonus: 112.50, riskPenalty: 0 },
+        breakdown: { balanceCapacity: 250, activityBonus: 45, ageBonus: 30, riskPenalty: 0 },
         explanation: ['Within capacity'],
       };
       mockEstimateCredit.mockResolvedValueOnce(mockResult as any);

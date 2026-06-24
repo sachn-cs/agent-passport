@@ -32,16 +32,27 @@ describe('Sybil Detection — Integration Tests (Real Testnet)', () => {
     expect(typeof result!.signals.circularActivity).toBe('number');
   }, 30000);
 
-  it('sybilRisk matches weighted formula', async () => {
+  it('sybilRisk matches weighted formula (11 signals)', async () => {
     const result = await detectSybil(TESTNET_WALLET);
 
     expect(result).not.toBeNull();
     const { signals } = result!;
+    const clustering = signals.neighborhoodClustering ?? 0;
+    const hub = signals.hubScore ?? 0;
+    const intermediate = signals.intermediateDensity ?? 0;
+    const temporal = signals.temporalCorrelation ?? 0;
     const expected = Math.round(Math.max(0, Math.min(1,
-      0.35 * signals.creationClustering +
-      0.30 * signals.interactionDensity +
-      0.20 * signals.balanceSimilarity +
-      0.15 * signals.circularActivity
+      0.20 * signals.creationClustering +
+      0.15 * signals.interactionDensity +
+      0.10 * signals.balanceSimilarity +
+      0.05 * signals.circularActivity +
+      0.08 * (signals.timingRegularity ?? 0) +
+      0.05 * (signals.amountFingerprint ?? 0) +
+      0.02 * (signals.fundingCorrelation ?? 0) +
+      0.10 * clustering +
+      0.08 * hub +
+      0.10 * intermediate +
+      0.07 * temporal
     )) * 100) / 100;
     expect(result!.sybilRisk).toBe(expected);
   }, 30000);

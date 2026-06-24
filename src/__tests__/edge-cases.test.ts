@@ -1,48 +1,50 @@
 import { describe, it, expect } from 'vitest';
+import {
+  computeAgeScore,
+  computeVelocityScore,
+  computeVolumeScore,
+  computeComplianceScore,
+  computeTrustScore,
+  classifyRisk,
+  generateExplanation,
+} from '../trust-score';
+import { isValidWallet, WALLET_REGEX } from '../lib/constants';
 
 describe('Edge Cases', () => {
   describe('Wallet address edge cases', () => {
     const VALID_WALLET = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ';
-    const WALLET_REGEX = /^[A-Z2-7]{58}$/;
 
     it('rejects wallet with space', () => {
-      expect(WALLET_REGEX.test(' ' + VALID_WALLET.slice(1))).toBe(false);
+      expect(isValidWallet(' ' + VALID_WALLET.slice(1))).toBe(false);
     });
 
     it('rejects wallet with special chars', () => {
-      expect(WALLET_REGEX.test('@'.repeat(58))).toBe(false);
+      expect(isValidWallet('@'.repeat(58))).toBe(false);
     });
 
     it('rejects empty string', () => {
-      expect(WALLET_REGEX.test('')).toBe(false);
+      expect(isValidWallet('')).toBe(false);
     });
 
     it('rejects 57 chars (one short)', () => {
-      expect(WALLET_REGEX.test('A'.repeat(57))).toBe(false);
+      expect(isValidWallet('A'.repeat(57))).toBe(false);
     });
 
     it('rejects 59 chars (one long)', () => {
-      expect(WALLET_REGEX.test('A'.repeat(59))).toBe(false);
+      expect(isValidWallet('A'.repeat(59))).toBe(false);
     });
 
     it('accepts all valid Algorand base32 chars', () => {
       const validChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
       const wallet = validChars.repeat(2).slice(0, 58);
-      expect(WALLET_REGEX.test(wallet)).toBe(true);
+      expect(isValidWallet(wallet)).toBe(true);
     });
   });
 
   describe('Math edge cases', () => {
     it('computeAgeScore handles very large days', () => {
-      const score = (days: number) => {
-        if (days <= 0) return 0;
-        if (days >= 730) return 100;
-        const linear = (days / 730) * 100;
-        const log = (Math.log10(days + 1) / Math.log10(731)) * 100;
-        return Math.round((linear * 0.6 + log * 0.4) * 10) / 10;
-      };
-      expect(score(10000)).toBe(100);
-      expect(score(Number.MAX_SAFE_INTEGER)).toBe(100);
+      expect(computeAgeScore(10000)).toBe(100);
+      expect(computeAgeScore(Number.MAX_SAFE_INTEGER)).toBe(100);
     });
 
     it('computeVelocityScore handles zero days', () => {
@@ -62,44 +64,16 @@ describe('Edge Cases', () => {
     });
 
     it('classifyRisk boundary values', () => {
-      const classify = (s: number) => {
-        if (s >= 70) return 'low';
-        if (s >= 45) return 'medium';
-        if (s >= 20) return 'high';
-        return 'critical';
-      };
-      expect(classify(69.9)).toBe('medium');
-      expect(classify(70)).toBe('low');
-      expect(classify(44.9)).toBe('high');
-      expect(classify(45)).toBe('medium');
-      expect(classify(19.9)).toBe('critical');
-      expect(classify(20)).toBe('high');
+      expect(classifyRisk(69.9)).toBe('medium');
+      expect(classifyRisk(70)).toBe('low');
+      expect(classifyRisk(44.9)).toBe('high');
+      expect(classifyRisk(45)).toBe('medium');
+      expect(classifyRisk(19.9)).toBe('critical');
+      expect(classifyRisk(20)).toBe('high');
     });
   });
 
   describe('Explanation generation edge cases', () => {
-    const generateExplanation = (
-      onChain: { balanceAlgo: number; totalTxns: number; assetCount: number; accountAgeDays: number },
-      trustScore: number
-    ): string[] => {
-      const reasons: string[] = [];
-      const { balanceAlgo, totalTxns, assetCount, accountAgeDays } = onChain;
-      if (accountAgeDays > 365) reasons.push(`${Math.floor(accountAgeDays / 365)}+ year wallet history`);
-      else if (accountAgeDays > 30) reasons.push(`${Math.floor(accountAgeDays / 30)}-month wallet history`);
-      else reasons.push('New wallet with limited history');
-      if (totalTxns > 100) reasons.push(`${totalTxns} transactions — active wallet`);
-      else if (totalTxns > 10) reasons.push(`${totalTxns} transactions — moderate activity`);
-      else reasons.push(`${totalTxns} transactions — limited activity`);
-      if (balanceAlgo > 100) reasons.push(`Balance: ${balanceAlgo.toFixed(2)} ALGO — well-funded`);
-      else if (balanceAlgo > 1) reasons.push(`Balance: ${balanceAlgo.toFixed(4)} ALGO`);
-      else reasons.push(`Balance: ${balanceAlgo.toFixed(6)} ALGO — low balance`);
-      if (assetCount > 5) reasons.push(`${assetCount} assets — diverse portfolio`);
-      if (trustScore >= 70) reasons.push('Strong overall trust profile');
-      else if (trustScore >= 40) reasons.push('Moderate trust profile');
-      else reasons.push('Weak trust profile — additional verification recommended');
-      return reasons;
-    };
-
     it('handles zero balance gracefully', () => {
       const reasons = generateExplanation(
         { balanceAlgo: 0, totalTxns: 0, assetCount: 0, accountAgeDays: 1 }, 0
@@ -154,6 +128,35 @@ describe('Edge Cases', () => {
         { balanceAlgo: 10, totalTxns: 5, assetCount: 6, accountAgeDays: 100 }, 50
       );
       expect(reasons6.some(r => r.includes('diverse portfolio'))).toBe(true);
+    });
+  });
+
+  describe('Compliance floor boundary', () => {
+    it('worst-case wallet (0 ALGO, 0 txns) scores 10', () => {
+      expect(computeComplianceScore(0, 0)).toBe(10);
+    });
+
+    it('wallet with 0 ALGO but activity scores higher', () => {
+      const score = computeComplianceScore(0, 10);
+      expect(score).toBeGreaterThan(10);
+    });
+
+    it('wallet with balance but no txns scores higher than floor', () => {
+      const score = computeComplianceScore(1_000_000, 0);
+      expect(score).toBe(50);
+      expect(score).toBeGreaterThan(10);
+    });
+
+    it('compliance score is always between 0 and 100', () => {
+      const inputs = [
+        [0, 0], [0, 1], [1_000_000, 0], [1_000_000, 100],
+        [500_000, 50], [999, 0], [999, 1],
+      ] as const;
+      for (const [bal, txns] of inputs) {
+        const score = computeComplianceScore(bal, txns);
+        expect(score).toBeGreaterThanOrEqual(0);
+        expect(score).toBeLessThanOrEqual(100);
+      }
     });
   });
 });

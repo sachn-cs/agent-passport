@@ -3,7 +3,6 @@ import {
   computeBalanceCapacity,
   computeActivityBonus,
   computeAgeBonus,
-  computeDelegationBonus,
   computeRiskPenalty,
   computeCreditLimit,
   classifyCreditRisk,
@@ -64,37 +63,25 @@ describe('Credit Capacity Estimation — Pure Math Functions', () => {
     });
   });
 
-  describe('computeDelegationBonus', () => {
-    it('returns 0 for score 0', () => {
-      expect(computeDelegationBonus(0)).toBe(0);
-    });
-
-    it('returns $3 per score point', () => {
-      expect(computeDelegationBonus(10)).toBe(30);
-      expect(computeDelegationBonus(50)).toBe(150);
-    });
-
-    it('caps at 300', () => {
-      expect(computeDelegationBonus(100)).toBe(300);
-      expect(computeDelegationBonus(150)).toBe(300);
-    });
-  });
-
   describe('computeRiskPenalty', () => {
     it('returns 0 when both scores are high', () => {
       expect(computeRiskPenalty(80, 90)).toBe(0);
     });
 
-    it('penalizes low velocity (< 40)', () => {
-      expect(computeRiskPenalty(30, 90)).toBe(50);
+    it('penalizes low velocity (< 40) continuously', () => {
+      expect(computeRiskPenalty(39, 90)).toBe(1.25);
+      expect(computeRiskPenalty(20, 90)).toBe(25);
+      expect(computeRiskPenalty(0, 90)).toBe(50);
     });
 
-    it('penalizes low compliance (< 60)', () => {
-      expect(computeRiskPenalty(80, 50)).toBe(100);
+    it('penalizes low compliance (< 60) continuously', () => {
+      expect(computeRiskPenalty(80, 59)).toBe(1.67);
+      expect(computeRiskPenalty(80, 30)).toBe(50);
+      expect(computeRiskPenalty(80, 0)).toBe(100);
     });
 
     it('penalizes both when both are low', () => {
-      expect(computeRiskPenalty(30, 50)).toBe(150);
+      expect(computeRiskPenalty(30, 50)).toBe(29.17);
     });
 
     it('does not penalize velocity at exactly 40', () => {
@@ -104,37 +91,49 @@ describe('Credit Capacity Estimation — Pure Math Functions', () => {
     it('does not penalize compliance at exactly 60', () => {
       expect(computeRiskPenalty(80, 60)).toBe(0);
     });
+
+    it('max penalty when both are 0', () => {
+      expect(computeRiskPenalty(0, 0)).toBe(150);
+    });
+
+    it('penalty scales smoothly (no cliff at threshold)', () => {
+      const p39 = computeRiskPenalty(39, 90);
+      const p40 = computeRiskPenalty(40, 90);
+      expect(p39).toBeGreaterThan(0);
+      expect(p40).toBe(0);
+      expect(p39).toBeLessThan(5);
+    });
   });
 
   describe('computeCreditLimit', () => {
     it('returns 0 for all-zero breakdown', () => {
       expect(computeCreditLimit({
-        balanceCapacity: 0, activityBonus: 0, ageBonus: 0, delegationBonus: 0, riskPenalty: 0,
+        balanceCapacity: 0, activityBonus: 0, ageBonus: 0, riskPenalty: 0,
       })).toBe(0);
     });
 
     it('computes sum of bonuses minus penalty', () => {
       expect(computeCreditLimit({
-        balanceCapacity: 100, activityBonus: 50, ageBonus: 30, delegationBonus: 60, riskPenalty: 0,
-      })).toBe(240);
+        balanceCapacity: 100, activityBonus: 50, ageBonus: 30, riskPenalty: 0,
+      })).toBe(180);
     });
 
     it('subtracts risk penalty', () => {
       expect(computeCreditLimit({
-        balanceCapacity: 100, activityBonus: 50, ageBonus: 30, delegationBonus: 60, riskPenalty: 100,
-      })).toBe(140);
+        balanceCapacity: 100, activityBonus: 50, ageBonus: 30, riskPenalty: 100,
+      })).toBe(80);
     });
 
     it('never goes below 0', () => {
       expect(computeCreditLimit({
-        balanceCapacity: 0, activityBonus: 0, ageBonus: 0, delegationBonus: 0, riskPenalty: 500,
+        balanceCapacity: 0, activityBonus: 0, ageBonus: 0, riskPenalty: 500,
       })).toBe(0);
     });
 
-    it('caps at 5000', () => {
+    it('caps at 1350', () => {
       expect(computeCreditLimit({
-        balanceCapacity: 1000, activityBonus: 200, ageBonus: 150, delegationBonus: 300, riskPenalty: 0,
-      })).toBe(1650);
+        balanceCapacity: 1000, activityBonus: 200, ageBonus: 150, riskPenalty: 0,
+      })).toBe(1350);
     });
   });
 
@@ -189,42 +188,37 @@ describe('Credit Capacity Estimation — Pure Math Functions', () => {
 
   describe('generateCreditExplanation', () => {
     it('identifies strong collateral', () => {
-      const reasons = generateCreditExplanation(500, 50, 100, 0, 400);
+      const reasons = generateCreditExplanation(500, 50, 100, 400);
       expect(reasons.some(r => r.includes('strong collateral'))).toBe(true);
     });
 
     it('identifies minimal collateral', () => {
-      const reasons = generateCreditExplanation(0.001, 0, 1, 0, 0);
+      const reasons = generateCreditExplanation(0.001, 0, 1, 0);
       expect(reasons.some(r => r.includes('minimal collateral'))).toBe(true);
     });
 
     it('identifies old account', () => {
-      const reasons = generateCreditExplanation(10, 50, 400, 0, 200);
+      const reasons = generateCreditExplanation(10, 50, 400, 200);
       expect(reasons.some(r => r.includes('year account'))).toBe(true);
     });
 
     it('identifies new account', () => {
-      const reasons = generateCreditExplanation(10, 5, 10, 0, 50);
+      const reasons = generateCreditExplanation(10, 5, 10, 50);
       expect(reasons.some(r => r.includes('New account'))).toBe(true);
     });
 
     it('identifies strong activity', () => {
-      const reasons = generateCreditExplanation(10, 200, 100, 0, 300);
+      const reasons = generateCreditExplanation(10, 200, 100, 300);
       expect(reasons.some(r => r.includes('strong activity'))).toBe(true);
     });
 
-    it('identifies well-sponsored', () => {
-      const reasons = generateCreditExplanation(10, 50, 100, 80, 300);
-      expect(reasons.some(r => r.includes('Well-sponsored'))).toBe(true);
-    });
-
     it('reports request within capacity', () => {
-      const reasons = generateCreditExplanation(100, 50, 100, 0, 300, 200, true);
+      const reasons = generateCreditExplanation(100, 50, 100, 300, 200, true);
       expect(reasons.some(r => r.includes('within estimated capacity'))).toBe(true);
     });
 
     it('reports request exceeds capacity', () => {
-      const reasons = generateCreditExplanation(10, 5, 10, 0, 50, 200, false);
+      const reasons = generateCreditExplanation(10, 5, 10, 50, 200, false);
       expect(reasons.some(r => r.includes('exceeds estimated capacity'))).toBe(true);
     });
   });

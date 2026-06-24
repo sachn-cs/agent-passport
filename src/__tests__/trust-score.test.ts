@@ -1,101 +1,19 @@
 import { describe, it, expect } from 'vitest';
-
-const WALLET_REGEX = /^[A-Z2-7]{58}$/;
-
-function computeAgeScore(days: number): number {
-  if (days <= 0) return 0;
-  if (days >= 730) return 100;
-  const linear = (days / 730) * 100;
-  const log = (Math.log10(days + 1) / Math.log10(731)) * 100;
-  return Math.round((linear * 0.6 + log * 0.4) * 10) / 10;
-}
-
-function computeActivityScore(txns: number, days: number, assets: number): number {
-  const txPerMonth = days > 0 ? txns / (days / 30) : 0;
-  return Math.min(100,
-    Math.min(40, txPerMonth * 2) +
-    Math.min(30, (days / 365) * 30) +
-    Math.min(30, assets * 3)
-  );
-}
-
-function computeVolumeScore(balanceMicroAlgo: number, txns: number): number {
-  const algo = balanceMicroAlgo / 1_000_000;
-  return Math.min(100,
-    Math.min(50, Math.log10(Math.max(1, algo)) * 10) +
-    Math.min(50, txns * 0.5)
-  );
-}
-
-function computeVelocityScore(txns: number, days: number): number {
-  if (days === 0) return 0;
-  const perDay = txns / Math.max(1, days);
-  if (perDay > 50) return 20;
-  if (perDay > 20) return 40;
-  if (perDay > 5) return 60;
-  if (perDay > 1) return 80;
-  return 100;
-}
-
-function computeComplianceScore(balanceMicroAlgo: number, txns: number): number {
-  let score = 100;
-  if (balanceMicroAlgo / 1_000_000 < 0.01) score -= 20;
-  if (txns === 0) score -= 30;
-  return Math.max(0, Math.min(100, score));
-}
-
-function computeTrustScore(breakdown: {
-  ageScore: number;
-  activityScore: number;
-  volumeScore: number;
-  velocityScore: number;
-  complianceScore: number;
-}): number {
-  const w = { age: 0.2, activity: 0.25, volume: 0.2, velocity: 0.15, compliance: 0.2 };
-  const total = w.age + w.activity + w.volume + w.velocity + w.compliance;
-  return Math.round(Math.max(0, Math.min(100,
-    (w.age / total) * breakdown.ageScore +
-    (w.activity / total) * breakdown.activityScore +
-    (w.volume / total) * breakdown.volumeScore +
-    (w.velocity / total) * breakdown.velocityScore +
-    (w.compliance / total) * breakdown.complianceScore
-  )) * 10) / 10;
-}
-
-function classifyRisk(score: number): 'low' | 'medium' | 'high' | 'critical' {
-  if (score >= 70) return 'low';
-  if (score >= 45) return 'medium';
-  if (score >= 20) return 'high';
-  return 'critical';
-}
-
-function computeRecommendedLimit(score: number): number {
-  const base = (score / 100) * 500;
-  const tier = score >= 80 ? 1.5 : score >= 60 ? 1.2 : score >= 40 ? 1.0 : 0.7;
-  return Math.round(base * tier * 100) / 100;
-}
-
-function generateExplanation(
-  onChain: { balanceAlgo: number; totalTxns: number; assetCount: number; accountAgeDays: number },
-  trustScore: number
-): string[] {
-  const reasons: string[] = [];
-  const { balanceAlgo, totalTxns, assetCount, accountAgeDays } = onChain;
-  if (accountAgeDays > 365) reasons.push(`${Math.floor(accountAgeDays / 365)}+ year wallet history`);
-  else if (accountAgeDays > 30) reasons.push(`${Math.floor(accountAgeDays / 30)}-month wallet history`);
-  else reasons.push('New wallet with limited history');
-  if (totalTxns > 100) reasons.push(`${totalTxns} transactions — active wallet`);
-  else if (totalTxns > 10) reasons.push(`${totalTxns} transactions — moderate activity`);
-  else reasons.push(`${totalTxns} transactions — limited activity`);
-  if (balanceAlgo > 100) reasons.push(`Balance: ${balanceAlgo.toFixed(2)} ALGO — well-funded`);
-  else if (balanceAlgo > 1) reasons.push(`Balance: ${balanceAlgo.toFixed(4)} ALGO`);
-  else reasons.push(`Balance: ${balanceAlgo.toFixed(6)} ALGO — low balance`);
-  if (assetCount > 5) reasons.push(`${assetCount} assets — diverse portfolio`);
-  if (trustScore >= 70) reasons.push('Strong overall trust profile');
-  else if (trustScore >= 40) reasons.push('Moderate trust profile');
-  else reasons.push('Weak trust profile — additional verification recommended');
-  return reasons;
-}
+import {
+  computeAgeScore,
+  computeActivityScore,
+  computeVolumeScore,
+  computeVelocityScore,
+  computeComplianceScore,
+  computeTrustScore,
+  classifyRisk,
+  computeRecommendedLimit,
+  generateExplanation,
+  computeStalenessPenalty,
+  applyFreshWalletCap,
+  applySybilPenalty,
+} from '../trust-score';
+import { isValidWallet, WALLET_REGEX } from '../lib/constants';
 
 describe('Trust Score — Pure Math Functions', () => {
   describe('computeAgeScore', () => {
@@ -175,8 +93,13 @@ describe('Trust Score — Pure Math Functions', () => {
       expect(computeVelocityScore(100, 0)).toBe(0);
     });
 
-    it('returns 20 for very high velocity', () => {
-      expect(computeVelocityScore(5000, 10)).toBe(20);
+    it('returns 0 for extreme velocity (>100 txns/day)', () => {
+      expect(computeVelocityScore(5000, 10)).toBe(0);
+      expect(computeVelocityScore(1000, 5)).toBe(0);
+    });
+
+    it('returns 20 for high velocity (50-100 txns/day)', () => {
+      expect(computeVelocityScore(600, 10)).toBe(20);
     });
 
     it('returns 100 for very low velocity', () => {
@@ -189,40 +112,79 @@ describe('Trust Score — Pure Math Functions', () => {
         computeVelocityScore(50, 100),
         computeVelocityScore(200, 100),
         computeVelocityScore(600, 100),
+        computeVelocityScore(1500, 100),
       ];
       for (let i = 1; i < scores.length; i++) {
         expect(scores[i]).toBeLessThanOrEqual(scores[i - 1]);
       }
     });
+
+    it('boundary: perDay=101 returns 0, perDay=100 returns 20, perDay=51 returns 20, perDay=50 returns 40', () => {
+      expect(computeVelocityScore(101, 1)).toBe(0);
+      expect(computeVelocityScore(100, 1)).toBe(20);
+      expect(computeVelocityScore(51, 1)).toBe(20);
+      expect(computeVelocityScore(50, 1)).toBe(40);
+    });
   });
 
   describe('computeComplianceScore', () => {
-    it('returns 100 for healthy account', () => {
-      expect(computeComplianceScore(1_000_000, 10)).toBe(100);
+    it('returns 100 for healthy account with sufficient activity', () => {
+      // algo=1.0 → balPen=0, 100 txns → txPen≈0, score=100
+      expect(computeComplianceScore(1_000_000, 100)).toBe(100);
     });
 
-    it('does not reduce score for balance exactly at threshold', () => {
-      const score = computeComplianceScore(10_000, 10);
-      expect(score).toBe(100);
+    it('returns 76 for healthy account with moderate activity', () => {
+      // algo=1.0 → balPen=0, 10 txns → txPen=Math.round(50-log10(11)*25)=24, score=76
+      expect(computeComplianceScore(1_000_000, 10)).toBe(76);
     });
 
-    it('reduces score for balance below threshold', () => {
-      const score = computeComplianceScore(9_999, 10);
-      expect(score).toBe(80);
+    it('does not apply balance penalty for balance >= 1 ALGO', () => {
+      expect(computeComplianceScore(1_000_000, 10)).toBe(76);
     });
 
-    it('reduces score for zero transactions', () => {
-      const score = computeComplianceScore(1_000_000, 0);
-      expect(score).toBe(70);
+    it('applies gradual balance penalty below 1 ALGO', () => {
+      // 0.5 ALGO → balPen=Math.round(0.5*40)=20, 10 txns → txPen=24, score=56
+      expect(computeComplianceScore(500_000, 10)).toBe(56);
     });
 
-    it('reduces both for low balance and zero txns', () => {
-      const score = computeComplianceScore(0, 0);
-      expect(score).toBe(50);
+    it('maximum balance penalty for 0 ALGO', () => {
+      // algo=0 → balPen=40, 10 txns → txPen=24, score=36
+      expect(computeComplianceScore(0, 10)).toBe(36);
+    });
+
+    it('maximum transaction penalty for zero transactions', () => {
+      // algo=1.0 → balPen=0, 0 txns → txPen=50, score=50
+      expect(computeComplianceScore(1_000_000, 0)).toBe(50);
+    });
+
+    it('gradual txn penalty scales with log₁₀', () => {
+      // 1 txn → txPen=Math.round(50-log10(2)*25)=Math.round(42.48)=42, score=58
+      const score1 = computeComplianceScore(1_000_000, 1);
+      expect(score1).toBe(58);
+      // 10 txns → txPen=24, score=76
+      const score10 = computeComplianceScore(1_000_000, 10);
+      expect(score10).toBe(76);
+      // 100 txns → txPen=Math.round(50-log10(101)*25)=Math.round(0)=0, score=100
+      const score100 = computeComplianceScore(1_000_000, 100);
+      expect(score100).toBe(100);
+    });
+
+    it('reduces both for low balance and zero txns (floor = 10)', () => {
+      // algo=0 → balPen=40, 0 txns → txPen=50, score=10
+      expect(computeComplianceScore(0, 0)).toBe(10);
     });
 
     it('never goes below 0', () => {
       expect(computeComplianceScore(0, 0)).toBeGreaterThanOrEqual(0);
+    });
+
+    it('floor of 10 is the worst-case score', () => {
+      expect(computeComplianceScore(0, 0)).toBe(10);
+    });
+
+    it('boundary: 0.01 ALGO gets near-maximum balance penalty', () => {
+      // algo=0.00001 → balPen=Math.round((1-0.00001)*40)=Math.round(39.9996)=40
+      expect(computeComplianceScore(10, 10)).toBe(36);
     });
   });
 
@@ -380,44 +342,172 @@ describe('Trust Score — Pure Math Functions', () => {
     });
   });
 
-  describe('Wallet address validation regex', () => {
+  describe('Wallet address validation', () => {
     it('accepts valid 58-char base32 address', () => {
-      expect(WALLET_REGEX.test('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ')).toBe(true);
+      expect(isValidWallet('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY5HFKQ')).toBe(true);
     });
 
     it('rejects too short', () => {
-      expect(WALLET_REGEX.test('AAAA')).toBe(false);
+      expect(isValidWallet('AAAA')).toBe(false);
     });
 
     it('rejects too long', () => {
-      expect(WALLET_REGEX.test('A'.repeat(59))).toBe(false);
+      expect(isValidWallet('A'.repeat(59))).toBe(false);
     });
 
     it('rejects lowercase', () => {
-      expect(WALLET_REGEX.test('a'.repeat(58))).toBe(false);
+      expect(isValidWallet('a'.repeat(58))).toBe(false);
     });
 
     it('accepts all Algorand base32 chars including O and I', () => {
-      expect(WALLET_REGEX.test('A'.repeat(58))).toBe(true);
-      expect(WALLET_REGEX.test('O'.repeat(58))).toBe(true);
-      expect(WALLET_REGEX.test('I'.repeat(58))).toBe(true);
-      expect(WALLET_REGEX.test('Z'.repeat(58))).toBe(true);
+      expect(isValidWallet('A'.repeat(58))).toBe(true);
+      expect(isValidWallet('O'.repeat(58))).toBe(true);
+      expect(isValidWallet('I'.repeat(58))).toBe(true);
+      expect(isValidWallet('Z'.repeat(58))).toBe(true);
     });
 
     it('rejects digits 0 and 1', () => {
-      expect(WALLET_REGEX.test('0'.repeat(58))).toBe(false);
-      expect(WALLET_REGEX.test('1'.repeat(58))).toBe(false);
+      expect(isValidWallet('0'.repeat(58))).toBe(false);
+      expect(isValidWallet('1'.repeat(58))).toBe(false);
     });
 
     it('accepts digits 2-7', () => {
-      expect(WALLET_REGEX.test('2222222222222222222222222222222222222222222222222222222222')).toBe(true);
-      expect(WALLET_REGEX.test('7777777777777777777777777777777777777777777777777777777777')).toBe(true);
+      expect(isValidWallet('2'.repeat(58))).toBe(true);
+      expect(isValidWallet('7'.repeat(58))).toBe(true);
     });
 
     it('accepts letters A-Z excluding O and I', () => {
-      expect(WALLET_REGEX.test('A'.repeat(58))).toBe(true);
-      expect(WALLET_REGEX.test('B'.repeat(58))).toBe(true);
-      expect(WALLET_REGEX.test('Z'.repeat(58))).toBe(true);
+      expect(isValidWallet('A'.repeat(58))).toBe(true);
+      expect(isValidWallet('B'.repeat(58))).toBe(true);
+      expect(isValidWallet('Z'.repeat(58))).toBe(true);
+    });
+  });
+
+  describe('computeStalenessPenalty', () => {
+    it('returns 1.0 within 180-day grace period', () => {
+      expect(computeStalenessPenalty(0)).toBe(1.0);
+      expect(computeStalenessPenalty(90)).toBe(1.0);
+      expect(computeStalenessPenalty(179)).toBe(1.0);
+      expect(computeStalenessPenalty(180)).toBe(1.0);
+    });
+
+    it('decays after grace period with 1-year half-life', () => {
+      // 180 + 365 = 545 days → decay factor = 0.5^1 = 0.5
+      expect(computeStalenessPenalty(545)).toBeCloseTo(0.5, 1);
+      // 180 + 730 = 910 days → decay factor = 0.5^2 = 0.25
+      expect(computeStalenessPenalty(910)).toBeCloseTo(0.25, 1);
+    });
+
+    it('never goes below floor of 0.30', () => {
+      expect(computeStalenessPenalty(5000)).toBeGreaterThanOrEqual(0.30);
+      expect(computeStalenessPenalty(100000)).toBeGreaterThanOrEqual(0.30);
+    });
+
+    it('is monotonically non-increasing', () => {
+      const penalties = [0, 180, 365, 545, 730, 910, 1825, 3650].map(computeStalenessPenalty);
+      for (let i = 1; i < penalties.length; i++) {
+        expect(penalties[i]).toBeLessThanOrEqual(penalties[i - 1]);
+      }
+    });
+
+    it('negative input returns 1.0 (edge case)', () => {
+      expect(computeStalenessPenalty(-100)).toBe(1.0);
+    });
+  });
+
+  describe('applyFreshWalletCap', () => {
+    it('caps at 30 for wallets younger than 30 days', () => {
+      expect(applyFreshWalletCap(80, 1)).toBe(30);
+      expect(applyFreshWalletCap(50, 15)).toBe(30);
+      expect(applyFreshWalletCap(30, 29)).toBe(30);
+    });
+
+    it('does not cap when score is already below 30', () => {
+      expect(applyFreshWalletCap(20, 1)).toBe(20);
+      expect(applyFreshWalletCap(0, 5)).toBe(0);
+    });
+
+    it('does not cap for wallets 30+ days old', () => {
+      expect(applyFreshWalletCap(80, 30)).toBe(80);
+      expect(applyFreshWalletCap(100, 365)).toBe(100);
+      expect(applyFreshWalletCap(50, 730)).toBe(50);
+    });
+
+    it('boundary: exactly 30 days is not capped', () => {
+      expect(applyFreshWalletCap(80, 30)).toBe(80);
+    });
+
+    it('boundary: 29 days is capped', () => {
+      expect(applyFreshWalletCap(80, 29)).toBe(30);
+    });
+
+    it('preserves score for old wallets regardless of value', () => {
+      expect(applyFreshWalletCap(100, 1000)).toBe(100);
+      expect(applyFreshWalletCap(0, 1000)).toBe(0);
+    });
+  });
+
+  describe('applySybilPenalty', () => {
+    it('no penalty for low sybil risk (< 0.25)', () => {
+      expect(applySybilPenalty(70, 0)).toBe(70);
+      expect(applySybilPenalty(70, 0.10)).toBe(70);
+      expect(applySybilPenalty(70, 0.24)).toBe(70);
+    });
+
+    it('no penalty for medium sybil risk (0.25-0.44)', () => {
+      expect(applySybilPenalty(70, 0.25)).toBe(70);
+      expect(applySybilPenalty(70, 0.44)).toBe(70);
+    });
+
+    it('20% reduction for high sybil risk (0.45-0.69)', () => {
+      // 70 * 0.8 = 56
+      expect(applySybilPenalty(70, 0.45)).toBe(56);
+      expect(applySybilPenalty(70, 0.55)).toBe(56);
+      expect(applySybilPenalty(70, 0.69)).toBe(56);
+    });
+
+    it('50% reduction for critical sybil risk (>= 0.70)', () => {
+      // 70 * 0.5 = 35
+      expect(applySybilPenalty(70, 0.70)).toBe(35);
+      expect(applySybilPenalty(70, 0.90)).toBe(35);
+      expect(applySybilPenalty(70, 1.0)).toBe(35);
+    });
+
+    it('boundary: 0.44 → no penalty, 0.45 → 20% penalty', () => {
+      expect(applySybilPenalty(100, 0.44)).toBe(100);
+      expect(applySybilPenalty(100, 0.45)).toBe(80);
+    });
+
+    it('boundary: 0.69 → 20%, 0.70 → 50%', () => {
+      expect(applySybilPenalty(100, 0.69)).toBe(80);
+      expect(applySybilPenalty(100, 0.70)).toBe(50);
+    });
+
+    it('handles zero trust score', () => {
+      expect(applySybilPenalty(0, 0.80)).toBe(0);
+    });
+
+    it('handles low trust score with high sybil', () => {
+      // 20 * 0.5 = 10
+      expect(applySybilPenalty(20, 0.80)).toBe(10);
+    });
+  });
+
+  describe('computeActivityScore edge cases', () => {
+    it('returns 0 for days=0 (NaN guard)', () => {
+      expect(computeActivityScore(0, 0, 0)).toBe(0);
+    });
+
+    it('returns 0 for negative days', () => {
+      expect(computeActivityScore(10, -1, 5)).toBe(0);
+    });
+
+    it('handles very large txn count', () => {
+      const score = computeActivityScore(100000, 365, 0);
+      // txPerMonth = 100000/(365/30) = 8219 → min(40, 16438) = 40
+      // age = min(30, 30) = 30
+      // assets = 0
+      expect(score).toBe(70);
     });
   });
 });

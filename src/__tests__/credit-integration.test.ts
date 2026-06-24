@@ -11,7 +11,7 @@ describe('Credit Capacity Estimation — Integration Tests (Real Testnet)', () =
     expect(result!.wallet).toBe(TESTNET_WALLET);
     expect(typeof result!.estimatedLimit).toBe('number');
     expect(result!.estimatedLimit).toBeGreaterThanOrEqual(0);
-    expect(result!.estimatedLimit).toBeLessThanOrEqual(5000);
+    expect(result!.estimatedLimit).toBeLessThanOrEqual(1350);
     expect(['low', 'medium', 'high', 'critical']).toContain(result!.risk);
     expect(typeof result!.confidence).toBe('number');
     expect(result!.confidence).toBeGreaterThanOrEqual(0.40);
@@ -27,7 +27,6 @@ describe('Credit Capacity Estimation — Integration Tests (Real Testnet)', () =
     expect(result!.breakdown.balanceCapacity).toBeGreaterThanOrEqual(0);
     expect(typeof result!.breakdown.activityBonus).toBe('number');
     expect(typeof result!.breakdown.ageBonus).toBe('number');
-    expect(typeof result!.breakdown.delegationBonus).toBe('number');
     expect(typeof result!.breakdown.riskPenalty).toBe('number');
   }, 30000);
 
@@ -36,8 +35,8 @@ describe('Credit Capacity Estimation — Integration Tests (Real Testnet)', () =
 
     expect(result).not.toBeNull();
     const b = result!.breakdown;
-    const raw = b.balanceCapacity + b.activityBonus + b.ageBonus + b.delegationBonus - b.riskPenalty;
-    const expected = Math.round(Math.max(0, Math.min(5000, raw)) * 100) / 100;
+    const raw = b.balanceCapacity + b.activityBonus + b.ageBonus - b.riskPenalty;
+    const expected = Math.round(Math.max(0, Math.min(1350, raw)) * 100) / 100;
     expect(result!.estimatedLimit).toBe(expected);
   }, 30000);
 

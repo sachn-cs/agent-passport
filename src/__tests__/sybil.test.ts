@@ -4,6 +4,9 @@ import {
   computeInteractionDensity,
   computeBalanceSimilarity,
   computeCircularActivity,
+  computeTimingRegularity,
+  computeAmountFingerprint,
+  computeFundingCorrelation,
   computeSybilRisk,
   classifySybilRisk,
   computeSybilConfidence,
@@ -25,7 +28,6 @@ describe('Sybil Detection — Pure Math Functions', () => {
     });
 
     it('returns partial score for mixed cluster', () => {
-      // 3 of 4 wallets in window → (3-1)/(4-1) = 0.67
       const result = computeCreationClustering([1000, 1010, 1020, 50000], 1000);
       expect(result).toBe(0.67);
     });
@@ -117,7 +119,6 @@ describe('Sybil Detection — Pure Math Functions', () => {
         { from: 'B', to: 'A' },
         { from: 'A', to: 'C' },
       ];
-      // 1 circular pair out of 2 unique pairs
       const result = computeCircularActivity(txns);
       expect(result).toBe(0.5);
     });
@@ -128,6 +129,75 @@ describe('Sybil Detection — Pure Math Functions', () => {
         { from: 'A', to: 'B' },
       ];
       expect(computeCircularActivity(txns)).toBe(0);
+    });
+  });
+
+  describe('computeTimingRegularity', () => {
+    it('returns 0 for single interval', () => {
+      expect(computeTimingRegularity([100])).toBe(0);
+    });
+
+    it('returns 1.0 for perfectly regular intervals', () => {
+      expect(computeTimingRegularity([100, 100, 100, 100])).toBe(1);
+    });
+
+    it('returns low score for irregular intervals', () => {
+      const result = computeTimingRegularity([10, 500, 20, 800]);
+      expect(result).toBeLessThan(0.3);
+    });
+
+    it('returns 0 for empty array', () => {
+      expect(computeTimingRegularity([])).toBe(0);
+    });
+
+    it('handles two intervals', () => {
+      expect(computeTimingRegularity([100, 100])).toBe(1);
+    });
+  });
+
+  describe('computeAmountFingerprint', () => {
+    it('returns 0 for single amount', () => {
+      expect(computeAmountFingerprint([100])).toBe(0);
+    });
+
+    it('returns high score for all identical amounts', () => {
+      // 10 identical amounts: 1 - 1/10 = 0.9
+      expect(computeAmountFingerprint([100, 100, 100, 100, 100, 100, 100, 100, 100, 100])).toBe(0.9);
+    });
+
+    it('returns 0 for all different amounts', () => {
+      expect(computeAmountFingerprint([100, 200, 300, 400])).toBe(0);
+    });
+
+    it('returns 0.5 for half identical', () => {
+      expect(computeAmountFingerprint([100, 100, 200, 200])).toBe(0.5);
+    });
+
+    it('returns 0 for empty array', () => {
+      expect(computeAmountFingerprint([])).toBe(0);
+    });
+  });
+
+  describe('computeFundingCorrelation', () => {
+    it('returns 0 for single funder', () => {
+      expect(computeFundingCorrelation(['A'])).toBe(0);
+    });
+
+    it('returns high score for all same funder', () => {
+      // 10 same funders: 1 - 1/10 = 0.9
+      expect(computeFundingCorrelation(['A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A'])).toBe(0.9);
+    });
+
+    it('returns 0 for all different funders', () => {
+      expect(computeFundingCorrelation(['A', 'B', 'C', 'D'])).toBe(0);
+    });
+
+    it('returns 0.5 for half same', () => {
+      expect(computeFundingCorrelation(['A', 'A', 'B', 'B'])).toBe(0.5);
+    });
+
+    it('returns 0 for empty array', () => {
+      expect(computeFundingCorrelation([])).toBe(0);
     });
   });
 
@@ -147,47 +217,131 @@ describe('Sybil Detection — Pure Math Functions', () => {
         interactionDensity: 1,
         balanceSimilarity: 1,
         circularActivity: 1,
+        timingRegularity: 1,
+        amountFingerprint: 1,
+        fundingCorrelation: 1,
+        neighborhoodClustering: 1,
+        hubScore: 1,
+        intermediateDensity: 1,
+        temporalCorrelation: 1,
       })).toBe(1);
     });
 
-    it('weights creation clustering at 0.35', () => {
+    it('weights creation clustering at 0.20', () => {
       const result = computeSybilRisk({
         creationClustering: 1,
         interactionDensity: 0,
         balanceSimilarity: 0,
         circularActivity: 0,
       });
-      expect(result).toBe(0.35);
+      expect(result).toBe(0.20);
     });
 
-    it('weights interaction density at 0.30', () => {
+    it('weights interaction density at 0.15', () => {
       const result = computeSybilRisk({
         creationClustering: 0,
         interactionDensity: 1,
         balanceSimilarity: 0,
         circularActivity: 0,
       });
-      expect(result).toBe(0.30);
+      expect(result).toBe(0.15);
     });
 
-    it('weights balance similarity at 0.20', () => {
+    it('weights balance similarity at 0.10', () => {
       const result = computeSybilRisk({
         creationClustering: 0,
         interactionDensity: 0,
         balanceSimilarity: 1,
         circularActivity: 0,
       });
-      expect(result).toBe(0.20);
+      expect(result).toBe(0.10);
     });
 
-    it('weights circular activity at 0.15', () => {
+    it('weights circular activity at 0.05', () => {
       const result = computeSybilRisk({
         creationClustering: 0,
         interactionDensity: 0,
         balanceSimilarity: 0,
         circularActivity: 1,
       });
-      expect(result).toBe(0.15);
+      expect(result).toBe(0.05);
+    });
+
+    it('weights timing regularity at 0.08', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        timingRegularity: 1,
+      });
+      expect(result).toBe(0.08);
+    });
+
+    it('weights amount fingerprint at 0.05', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        amountFingerprint: 1,
+      });
+      expect(result).toBe(0.05);
+    });
+
+    it('weights funding correlation at 0.02', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        fundingCorrelation: 1,
+      });
+      expect(result).toBe(0.02);
+    });
+
+    it('weights neighborhood clustering at 0.10', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        neighborhoodClustering: 1,
+      });
+      expect(result).toBe(0.10);
+    });
+
+    it('weights hub score at 0.08', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        hubScore: 1,
+      });
+      expect(result).toBe(0.08);
+    });
+
+    it('weights intermediate density at 0.10', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        intermediateDensity: 1,
+      });
+      expect(result).toBe(0.10);
+    });
+
+    it('weights temporal correlation at 0.07', () => {
+      const result = computeSybilRisk({
+        creationClustering: 0,
+        interactionDensity: 0,
+        balanceSimilarity: 0,
+        circularActivity: 0,
+        temporalCorrelation: 1,
+      });
+      expect(result).toBe(0.07);
     });
 
     it('clamps to [0, 1]', () => {
@@ -280,6 +434,21 @@ describe('Sybil Detection — Pure Math Functions', () => {
     it('reports low sybil risk for clean wallet', () => {
       const reasons = generateSybilExplanation(1, 0, 0, 0, 0, 0.05);
       expect(reasons.some(r => r.includes('Low sybil risk'))).toBe(true);
+    });
+
+    it('reports bot-like timing patterns', () => {
+      const reasons = generateSybilExplanation(4, 0.9, 0.95, 0.85, 0.7, 0.91, 0.9, 0.8, 0.6);
+      expect(reasons.some(r => r.includes('Bot-like timing'))).toBe(true);
+    });
+
+    it('reports uniform amounts', () => {
+      const reasons = generateSybilExplanation(4, 0.9, 0.95, 0.85, 0.7, 0.91, 0.9, 0.8, 0.6);
+      expect(reasons.some(r => r.includes('Uniform transaction amounts'))).toBe(true);
+    });
+
+    it('reports common funding source', () => {
+      const reasons = generateSybilExplanation(4, 0.9, 0.95, 0.85, 0.7, 0.91, 0.9, 0.8, 0.6);
+      expect(reasons.some(r => r.includes('Common funding source'))).toBe(true);
     });
   });
 });
