@@ -1,5 +1,5 @@
-import { scoreWallet } from './trust-score';
-import { scoreDelegation } from './delegation';
+import { scoreWallet, type WalletTrustScore } from './trust-score';
+import { isValidWallet } from './lib/constants';
 
 export interface CreditEstimate {
   wallet: string;
@@ -11,7 +11,6 @@ export interface CreditEstimate {
     balanceCapacity: number;
     activityBonus: number;
     ageBonus: number;
-    delegationBonus: number;
     riskPenalty: number;
   };
   explanation: string[];
@@ -31,27 +30,53 @@ export function computeAgeBonus(accountAgeDays: number): number {
   return Math.min(150, Math.max(0, (accountAgeDays / 365) * 150));
 }
 
-export function computeDelegationBonus(delegationScore: number): number {
-  return Math.min(300, Math.max(0, delegationScore * 3));
-}
-
+/**
+ * Computes risk penalty for low velocity and compliance scores.
+ *
+ * Design rationale:
+ * - Binary thresholds (pass/fail) create cliff effects at arbitrary boundaries
+ * - Continuous penalties provide smoother graduation between risk levels
+ * - Velocity penalty (0-50): penalizes bot/spam behavior, scales with severity
+ * - Compliance penalty (0-100): penalizes low balance/zero txns, scales with severity
+ * - Velocity < 40 = bot-like behavior → up to $50 penalty
+ * - Compliance < 60 = low usage/abandoned → up to $100 penalty
+ *
+ * Examples:
+ *   velocity=39, compliance=90 → (40-39)/40*50 = $1.25
+ *   velocity=20, compliance=40 → (40-20)/40*50 + (60-20)/60*100 = $25+$67 = $92
+ *   velocity=0,  compliance=0  → 50 + 100 = $150 (max penalty)
+ */
 export function computeRiskPenalty(velocityScore: number, complianceScore: number): number {
-  let penalty = 0;
-  if (velocityScore < 40) penalty += 50;
-  if (complianceScore < 60) penalty += 100;
-  return penalty;
+  const velocityPenalty = velocityScore < 40
+    ? Math.round((40 - velocityScore) / 40 * 50 * 100) / 100
+    : 0;
+  const compliancePenalty = complianceScore < 60
+    ? Math.round((60 - complianceScore) / 60 * 100 * 100) / 100
+    : 0;
+  return Math.round((velocityPenalty + compliancePenalty) * 100) / 100;
 }
 
+/**
+ * Computes credit limit from on-chain capacity components only.
+ *
+ * Design rationale (post-audit):
+ * - Delegation is a trust endorsement, not collateral — removed from capacity formula
+ * - Credit capacity must be backed by the wallet's own on-chain activity
+ * - Max capacity = 1000 (balance) + 200 (activity) + 150 (age) = 1350
+ * - This prevents double-counting: delegation score is used ONLY in underwriting
+ *   as a quality multiplier on the credit limit, not as a capacity component
+ *
+ * Formula: max(0, min(1350, balanceCapacity + activityBonus + ageBonus - riskPenalty))
+ */
 export function computeCreditLimit(breakdown: {
   balanceCapacity: number;
   activityBonus: number;
   ageBonus: number;
-  delegationBonus: number;
   riskPenalty: number;
 }): number {
   const raw = breakdown.balanceCapacity + breakdown.activityBonus +
-    breakdown.ageBonus + breakdown.delegationBonus - breakdown.riskPenalty;
-  return Math.round(Math.max(0, Math.min(5000, raw)) * 100) / 100;
+    breakdown.ageBonus - breakdown.riskPenalty;
+  return Math.round(Math.max(0, Math.min(1350, raw)) * 100) / 100;
 }
 
 export function classifyCreditRisk(
@@ -80,7 +105,6 @@ export function generateCreditExplanation(
   balanceAlgo: number,
   totalTxns: number,
   accountAgeDays: number,
-  delegationScore: number,
   estimatedLimit: number,
   requestedAmount?: number,
   approved?: boolean
@@ -111,12 +135,6 @@ export function generateCreditExplanation(
     reasons.push(`${totalTxns} transactions — limited activity`);
   }
 
-  if (delegationScore > 70) {
-    reasons.push(`Well-sponsored (delegation score: ${delegationScore})`);
-  } else if (delegationScore > 0) {
-    reasons.push(`Moderately sponsored (delegation score: ${delegationScore})`);
-  }
-
   if (requestedAmount && approved !== undefined) {
     if (approved) {
       reasons.push(`Request ($${requestedAmount}) within estimated capacity of $${estimatedLimit.toFixed(2)}`);
@@ -134,25 +152,20 @@ export async function estimateCredit(
   wallet: string,
   requestedAmount?: number
 ): Promise<CreditEstimate | null> {
-  if (!/^[A-Z2-7]{58}$/.test(wallet)) return null;
+  if (!isValidWallet(wallet)) return null;
 
-  const [onChainResult, delegationResult] = await Promise.all([
-    scoreWallet(wallet),
-    scoreDelegation(wallet),
-  ]);
+  const onChainResult = await scoreWallet(wallet);
 
   const balanceAlgo = onChainResult?.onChain.balanceAlgo ?? 0;
   const totalTxns = onChainResult?.onChain.totalTxns ?? 0;
   const accountAgeDays = onChainResult?.onChain.accountAgeDays ?? 0;
   const velocityScore = onChainResult?.breakdown.velocityScore ?? 50;
   const complianceScore = onChainResult?.breakdown.complianceScore ?? 50;
-  const delegationScore = delegationResult?.trustScore ?? 0;
 
   const breakdown = {
     balanceCapacity: computeBalanceCapacity(balanceAlgo),
     activityBonus: computeActivityBonus(totalTxns),
     ageBonus: computeAgeBonus(accountAgeDays),
-    delegationBonus: computeDelegationBonus(delegationScore),
     riskPenalty: computeRiskPenalty(velocityScore, complianceScore),
   };
 
@@ -167,12 +180,67 @@ export async function estimateCredit(
   if (balanceAlgo > 1) dataPoints++;
   if (totalTxns > 10) dataPoints++;
   if (accountAgeDays > 30) dataPoints++;
-  if (delegationScore > 0) dataPoints++;
   if (complianceScore >= 80) dataPoints++;
   const confidence = computeCreditConfidence(dataPoints);
 
   const explanation = generateCreditExplanation(
-    balanceAlgo, totalTxns, accountAgeDays, delegationScore,
+    balanceAlgo, totalTxns, accountAgeDays,
+    estimatedLimit, requestedAmount, approved
+  );
+
+  return {
+    wallet,
+    estimatedLimit,
+    risk,
+    confidence,
+    approved,
+    breakdown,
+    explanation,
+  };
+}
+
+/**
+ * Estimates credit using pre-fetched trust data (for passport generation).
+ * Eliminates the redundant scoreWallet() call that estimateCredit() makes internally.
+ *
+ * This ensures the trust score used for identityStrength and the trust score used
+ * for credit limit are identical — preventing contradictory passports.
+ */
+export async function estimateCreditWithTrust(
+  wallet: string,
+  trustData: WalletTrustScore | null,
+  requestedAmount?: number
+): Promise<CreditEstimate | null> {
+  if (!isValidWallet(wallet)) return null;
+
+  const balanceAlgo = trustData?.onChain.balanceAlgo ?? 0;
+  const totalTxns = trustData?.onChain.totalTxns ?? 0;
+  const accountAgeDays = trustData?.onChain.accountAgeDays ?? 0;
+  const velocityScore = trustData?.breakdown.velocityScore ?? 50;
+  const complianceScore = trustData?.breakdown.complianceScore ?? 50;
+
+  const breakdown = {
+    balanceCapacity: computeBalanceCapacity(balanceAlgo),
+    activityBonus: computeActivityBonus(totalTxns),
+    ageBonus: computeAgeBonus(accountAgeDays),
+    riskPenalty: computeRiskPenalty(velocityScore, complianceScore),
+  };
+
+  const estimatedLimit = computeCreditLimit(breakdown);
+  const risk = classifyCreditRisk(estimatedLimit, requestedAmount);
+  const approved = requestedAmount && requestedAmount > 0
+    ? estimatedLimit >= requestedAmount
+    : true;
+
+  let dataPoints = 0;
+  if (balanceAlgo > 1) dataPoints++;
+  if (totalTxns > 10) dataPoints++;
+  if (accountAgeDays > 30) dataPoints++;
+  if (complianceScore >= 80) dataPoints++;
+  const confidence = computeCreditConfidence(dataPoints);
+
+  const explanation = generateCreditExplanation(
+    balanceAlgo, totalTxns, accountAgeDays,
     estimatedLimit, requestedAmount, approved
   );
 

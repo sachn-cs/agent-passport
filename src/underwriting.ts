@@ -1,8 +1,20 @@
-import { scoreWallet } from './trust-score';
-import { scoreDelegation } from './delegation';
-import { estimateCredit } from './credit';
-import { detectSybil } from './sybil';
+import { scoreWallet, scoreWalletFresh, applySybilPenalty } from './trust-score';
+import { scoreDelegationFresh } from './delegation';
+import { estimateCreditWithTrust } from './credit';
+import { detectSybil, detectSybilFresh } from './sybil';
 import { computeReputation } from './reputation';
+import { logger } from './lib/logger';
+import { isValidWallet } from './lib/constants';
+import {
+  MAX_SYSTEM_EXPOSURE,
+  getSystemExposure,
+  addSystemExposure,
+  resetSystemExposure,
+  capToSystemCapacity,
+} from './lib/system-exposure';
+
+// Re-export for backward compatibility
+export { MAX_SYSTEM_EXPOSURE, getSystemExposure, addSystemExposure, resetSystemExposure, capToSystemCapacity };
 
 export interface UnderwritingFactor {
   name: string;
@@ -42,13 +54,30 @@ export function classifyUnderwritingRisk(
   return 'critical';
 }
 
+/**
+ * Computes recommended limit from credit capacity + quality multipliers.
+ *
+ * Design rationale (post-audit):
+ * - creditLimit is the base (backed by on-chain collateral)
+ * - compositeScore multiplier scales quality: better wallets get more of their capacity
+ * - sybilMultiplier penalizes coordinated inauthentic behavior
+ * - reputationMultiplier rewards positive on-chain reputation
+ * - NO delegation double-count: delegation appears ONLY in compositeScore
+ * - NO self-reference: creditLimit does NOT feed back into compositeScore
+ * - Formula is O(creditLimit), not O(creditLimit²)
+ *
+ * Bounds:
+ * - scoreMultiplier ∈ [0.5, 1.5]
+ * - sybilMultiplier ∈ [0.3, 1.0]
+ * - reputationMultiplier ∈ [1.0, 1.3]
+ * - Max recommendedLimit = creditLimit × 1.5 × 1.0 × 1.3 = 1.95 × creditLimit
+ */
 export function computeUnderwritingLimit(
   compositeScore: number,
   creditLimit: number,
   sybilRisk: number,
   reputation: number
 ): number {
-  // Start with credit limit as base
   let limit = creditLimit;
 
   // Apply composite score multiplier (0.5 – 1.5)
@@ -63,7 +92,7 @@ export function computeUnderwritingLimit(
   const reputationMultiplier = 1.0 + (reputation / 100) * 0.3;
   limit *= reputationMultiplier;
 
-  return Math.round(Math.max(0, Math.min(10000, limit)) * 100) / 100;
+  return Math.round(Math.max(0, Math.min(1350, limit)) * 100) / 100;
 }
 
 export function decideApproval(
@@ -127,89 +156,91 @@ export function generateUnderwritingExplanation(
 
 // ── Main function ──────────────────────────────────────────────
 
+/**
+ * Underwrites a wallet for credit.
+ *
+ * Factor architecture (post-audit, no double-counting):
+ *   Trust Score (0.35)    — on-chain quality, includes activity/age/volume/velocity/compliance
+ *   Delegation (0.25)     — endorsement network quality
+ *   Sybil Resistance (0.20) — resistance to coordinated fake accounts
+ *   Reputation (0.20)     — on-chain event reputation
+ *
+ * Each factor represents an independent signal:
+ * - Trust Score: wallet's own on-chain behavior
+ * - Delegation: external endorsements from other wallets
+ * - Sybil Resistance: cluster analysis of related wallets
+ * - Reputation: event-based track record
+ *
+ * Credit capacity (creditLimit) is used ONLY as the base in computeUnderwritingLimit.
+ * It does NOT appear in compositeScore, preventing self-referential O(creditLimit²).
+ */
 export async function underwrite(
   wallet: string
 ): Promise<UnderwritingDecision | null> {
-  if (!/^[A-Z2-7]{58}$/.test(wallet)) return null;
+  if (!isValidWallet(wallet)) return null;
 
-  // Fetch all 6 services in parallel
-  const [trustResult, delegationResult, creditResult, sybilResult, reputationResult] =
+  // P1 FIX: Fetch trust data first (needed for credit estimation), then fetch others in parallel
+  const trustResult = await scoreWalletFresh(wallet)
+    .catch(e => { logger.warn('scoreWalletFresh failed', { wallet, error: String(e) }); return null; });
+
+  // Fetch remaining services in parallel using fresh data
+  const [delegationResult, creditResult, sybilResult, reputationResult] =
     await Promise.all([
-      scoreWallet(wallet),
-      scoreDelegation(wallet),
-      estimateCredit(wallet),
-      detectSybil(wallet),
-      computeReputation(wallet),
+      scoreDelegationFresh(wallet).catch(e => { logger.warn('scoreDelegationFresh failed', { wallet, error: String(e) }); return null; }),
+      // P1 FIX: Use estimateCreditWithTrust to prevent redundant fetch and ensure consistency
+      estimateCreditWithTrust(wallet, trustResult).catch(e => { logger.warn('estimateCreditWithTrust failed', { wallet, error: String(e) }); return null; }),
+      detectSybilFresh(wallet).catch(e => { logger.warn('detectSybilFresh failed', { wallet, error: String(e) }); return null; }),
+      computeReputation(wallet).catch(e => { logger.warn('computeReputation failed', { wallet, error: String(e) }); return null; }),
     ]);
 
-  // Build factors from each service
+  // Build factors — each independent, no double-counting
   const factors: UnderwritingFactor[] = [];
 
-  // Factor 1: Trust Score (weight: 0.25)
-  const trustScore = trustResult?.trustScore ?? 0;
+  // Factor 1: Trust Score (weight: 0.35)
+  // Apply sybil penalty: high sybil risk reduces trust contribution
+  const rawTrustScore = trustResult?.trustScore ?? 0;
+  const sybilRiskValue = sybilResult?.sybilRisk ?? 0;
+  const trustScore = applySybilPenalty(rawTrustScore, sybilRiskValue);
   factors.push({
     name: 'Trust Score',
     score: trustScore,
-    weight: 0.25,
-    contribution: trustScore * 0.25,
+    weight: 0.35,
+    contribution: trustScore * 0.35,
     status: trustScore >= 70 ? 'positive' : trustScore >= 40 ? 'neutral' : 'negative',
   });
 
-  // Factor 2: Delegation (weight: 0.15)
+  // Factor 2: Delegation (weight: 0.25)
+  // NOT in credit formula — only here as quality multiplier
   const delegationScore = delegationResult?.trustScore ?? 0;
   factors.push({
     name: 'Delegation Trust',
     score: delegationScore,
-    weight: 0.15,
-    contribution: delegationScore * 0.15,
+    weight: 0.25,
+    contribution: delegationScore * 0.25,
     status: delegationScore >= 70 ? 'positive' : delegationScore >= 40 ? 'neutral' : 'negative',
   });
 
-  // Factor 3: Credit Capacity (weight: 0.20)
-  const creditScore = creditResult
-    ? Math.min(100, (creditResult.estimatedLimit / 5000) * 100)
-    : 0;
-  factors.push({
-    name: 'Credit Capacity',
-    score: creditScore,
-    weight: 0.20,
-    contribution: creditScore * 0.20,
-    status: creditScore >= 70 ? 'positive' : creditScore >= 40 ? 'neutral' : 'negative',
-  });
-
-  // Factor 4: Sybil Risk (weight: 0.15) — inverted (low sybil = high score)
+  // Factor 3: Sybil Resistance (weight: 0.20) — inverted (low sybil = high score)
   const sybilScore = sybilResult ? (1 - sybilResult.sybilRisk) * 100 : 50;
   factors.push({
     name: 'Sybil Resistance',
     score: sybilScore,
-    weight: 0.15,
-    contribution: sybilScore * 0.15,
+    weight: 0.20,
+    contribution: sybilScore * 0.20,
     status: sybilScore >= 70 ? 'positive' : sybilScore >= 40 ? 'neutral' : 'negative',
   });
 
-  // Factor 5: Reputation (weight: 0.15)
+  // Factor 4: Reputation (weight: 0.20)
   const reputationScore = reputationResult?.reputation ?? 0;
   factors.push({
     name: 'Reputation',
     score: reputationScore,
-    weight: 0.15,
-    contribution: reputationScore * 0.15,
+    weight: 0.20,
+    contribution: reputationScore * 0.20,
     status: reputationScore >= 70 ? 'positive' : reputationScore >= 40 ? 'neutral' : 'negative',
   });
 
-  // Factor 6: On-chain Activity (weight: 0.10)
-  const activityScore = trustResult
-    ? Math.min(100, trustResult.breakdown.activityScore)
-    : 0;
-  factors.push({
-    name: 'On-chain Activity',
-    score: activityScore,
-    weight: 0.10,
-    contribution: activityScore * 0.10,
-    status: activityScore >= 70 ? 'positive' : activityScore >= 40 ? 'neutral' : 'negative',
-  });
-
-  // Compute composite score
+  // Compute composite score (no self-reference — creditLimit NOT included)
   const compositeScore = computeCompositeScore(factors);
 
   // Decision
@@ -218,11 +249,19 @@ export async function underwrite(
   const approved = decideApproval(compositeScore, sybilRisk, reputation);
   const riskLevel = classifyUnderwritingRisk(compositeScore);
 
-  // Recommended limit
-  const creditLimit = creditResult?.estimatedLimit ?? 0;
-  const recommendedLimit = approved
+  // Recommended limit (creditLimit as base, NOT in compositeScore)
+  let creditLimit = creditResult?.estimatedLimit ?? 0;
+  let recommendedLimit = approved
     ? computeUnderwritingLimit(compositeScore, creditLimit, sybilRisk, reputation)
     : 0;
+
+  // System capacity guard: cap to remaining system exposure
+  recommendedLimit = capToSystemCapacity(recommendedLimit);
+
+  // Track system exposure
+  if (recommendedLimit > 0) {
+    addSystemExposure(recommendedLimit);
+  }
 
   // Confidence
   const confidence = computeUnderwritingConfidence(factors);

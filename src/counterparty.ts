@@ -1,5 +1,6 @@
 import { scoreWallet } from './trust-score';
 import { scoreDelegation } from './delegation';
+import { isValidWallet } from './lib/constants';
 
 export interface CounterpartyResult {
   allow: boolean;
@@ -29,8 +30,18 @@ export function computeConfidence(combinedScore: number): number {
   return Math.round(Math.max(0.3, Math.min(1.0, confidence)) * 100) / 100;
 }
 
-export function decideAllow(combinedScore: number): boolean {
-  return combinedScore >= 40;
+/**
+ * Decides whether to allow a counterparty.
+ *
+ * Design rationale:
+ * - Score threshold (40): minimum trust score for approval
+ * - Confidence threshold (0.45): prevents low-confidence approvals
+ *   A wallet with score 40 and confidence 0.30 has insufficient data
+ *   to make a reliable decision — deny and request more data
+ * - Combined threshold ensures both signal strength AND signal reliability
+ */
+export function decideAllow(combinedScore: number, confidence: number = 1.0): boolean {
+  return combinedScore >= 40 && confidence >= 0.45;
 }
 
 export function classifyCounterpartyRisk(score: number): 'low' | 'medium' | 'high' | 'critical' {
@@ -82,7 +93,7 @@ export function generateCounterpartyExplanation(
 // ── Main function ──────────────────────────────────────────────
 
 export async function checkCounterparty(buyer: string): Promise<CounterpartyResult | null> {
-  if (!/^[A-Z2-7]{58}$/.test(buyer)) return null;
+  if (!isValidWallet(buyer)) return null;
 
   const [onChainResult, delegationResult] = await Promise.all([
     scoreWallet(buyer),
@@ -93,8 +104,8 @@ export async function checkCounterparty(buyer: string): Promise<CounterpartyResu
   const delegationScore = delegationResult?.trustScore ?? 0;
 
   const trustScore = computeCombinedScore(onChainScore, delegationScore);
-  const allow = decideAllow(trustScore);
   const confidence = computeConfidence(trustScore);
+  const allow = decideAllow(trustScore, confidence);
   const riskLevel = classifyCounterpartyRisk(trustScore);
 
   const explanation = generateCounterpartyExplanation(
